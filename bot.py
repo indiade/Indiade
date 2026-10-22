@@ -185,10 +185,14 @@ async def on_ready():
         await cache_guild_invites(guild)
     if not started:
         started = True
-        try:
-            await tree.sync()
-        except Exception as e:
-            print(f"Slash command sync error: {e}")
+        # Synchronizace příkazů přímo na servery = okamžitě viditelné
+        for guild in bot.guilds:
+            try:
+                tree.copy_global_to(guild=guild)
+                cmds = await tree.sync(guild=guild)
+                print(f"Slash příkazy na {guild.name}: {[c.name for c in cmds]}")
+            except Exception as e:
+                print(f"Slash command sync error na {guild.name}: {e}")
         bot.loop.create_task(status_loop())
     await update_status_embed()
 
