@@ -5,6 +5,9 @@ import builtins
 print = functools.partial(builtins.print, flush=True)
 import json
 import asyncio
+import io
+import time
+from datetime import datetime, timezone
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -27,6 +30,7 @@ DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invites.js
 intents = discord.Intents.default()
 intents.members = True
 intents.invites = True
+intents.message_content = True  # needed for ticket transcripts
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
@@ -273,6 +277,8 @@ async def on_ready():
             except Exception as e:
                 print(f"Slash command sync error on {guild.name}: {e}")
         bot.loop.create_task(status_loop())
+        register_ticket_views()
+        bot.loop.create_task(ticket_inactivity_loop())
     for guild in bot.guilds:
         await cache_guild_invites(guild)
     print("Invite cache ready")
@@ -280,7 +286,14 @@ async def on_ready():
         await update_leaderboard()
     except Exception as e:
         print(f"Leaderboard error: {e}")
-    await update_status_embed()
+    try:
+        await update_status_embed()
+    except Exception as e:
+        print(f"Status embed error: {e}")
+    try:
+        await setup_ticket_panel()
+    except Exception as e:
+        print(f"Ticket panel error: {e}")
 
 @bot.event
 async def on_invite_create(invite):
@@ -406,4 +419,750 @@ async def invites_top(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
-bot.run(TOKEN)
+# =====================================================================
+# ---------- Ticket system ----------
+# =====================================================================
+
+SUPPORT_ROLE_IDS = [1558535971748716635, 1558535782401310820, 1558535578843095132]
+TICKET_PANEL_CHANNEL_ID = 1562874803231133908
+TICKET_LOG_CHANNEL_ID = 1562875188637474926
+TICKET_CATEGORY_NAME = "Tickets"
+PANEL_TITLE = "🎫 Indiade Support Tickets"
+TICKETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tickets.json")
+
+UNCLAIMED_PING_AFTER = 4 * 3600
+AUTHOR_REMIND_AFTER = 24 * 3600
+AUTHOR_CLOSE_AFTER = 24 * 3600
+INACTIVITY_CHECK_EVERY = 600
+
+HIGH_PRIORITY_WORDS = ["hack", "cheat", "grief", "scam", "payment", "refund", "ban", "exploit", "dupe"]
+PRIORITY_COLORS = {"High": 0xFF3B4D, "Normal": 0x3BA7FF}
+
+# key -> (label, emoji, slug, [(question, placeholder, min_len, paragraph)])
+TICKET_CATEGORIES = {
+    "support": ("Support", "🛠️", "support", [
+        ("Subject", "Short summary of your issue", 3, False),
+        ("Describe the problem", "Tell us as much as you can", 10, True)]),
+    "bug": ("Bug Report", "🐛", "bug-report", [
+        ("What's the bug?", "Describe what goes wrong", 10, True),
+        ("Steps to reproduce", "1. ... 2. ... 3. ...", 10, True),
+        ("MC version / where it happened", "e.g. 1.21.4, spawn, /warp shop", 2, False)]),
+    "player": ("Player Report", "⚠️", "player-report", [
+        ("Player name", "Exact in-game name", 2, False),
+        ("What happened?", "Describe the situation", 10, True),
+        ("Proof (links)", "Screenshot / video links", 4, True)]),
+    "payment": ("Purchase / Payment", "💰", "payment", [
+        ("In-game name", "Your Minecraft name", 2, False),
+        ("Transaction ID / email", "From your receipt", 3, False),
+        ("Describe the issue", "What went wrong with the purchase?", 10, True)]),
+    "partner": ("Partnership", "🤝", "partnership", [
+        ("Project / community name", "Name of your server, channel, ...", 2, False),
+        ("Links & audience size", "Links, member / follower counts", 4, True),
+        ("Your proposal", "What do you have in mind?", 20, True)]),
+    "minecraft": ("Minecraft Server", "⛏️", "minecraft", [
+        ("In-game name", "Your Minecraft name", 2, False),
+        ("Subject", "Short summary", 3, False),
+        ("Details", "Describe your question or issue", 10, True)]),
+    "other": ("Other", "❓", "other", [
+        ("Subject", "Short summary", 3, False),
+        ("Details", "How can we help?", 10, True)]),
+}
+
+
+def load_tickets():
+    try:
+        with open(TICKETS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        d = {}
+    d.setdefault("counter", 0)
+    d.setdefault("panel_message_id", None)
+    d.setdefault("open", {})       # channel_id(str) -> ticket
+    d.setdefault("closed", [])
+    d.setdefault("rating_msgs", {})  # message_id(str) -> ticket number
+    return d
+
+def save_tickets():
+    try:
+        tmp = TICKETS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(tdata, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TICKETS_FILE)
+    except Exception as e:
+        print(f"Ticket save error: {e}")
+
+tdata = load_tickets()
+closing_channels = set()
+
+
+# ---------- Pure helpers (unit-tested) ----------
+
+def slugify(text, max_len=100):
+    import unicodedata, re
+    text = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    text = re.sub(r"-{2,}", "-", text)
+    return text[:max_len].strip("-")
+
+def ticket_channel_name(category_slug, username):
+    user = slugify(username) or "user"
+    return slugify(f"{category_slug}-{user}", 100) or "ticket"
+
+def detect_priority(*texts):
+    import re
+    blob = " ".join(t or "" for t in texts).lower()
+    # stems like hack/cheat match hacker, cheating...; short words (ban) only as whole words + common suffixes
+    pat = r"\b(?:" + "|".join(HIGH_PRIORITY_WORDS) + r")(?:s|ed|ned|ing|ning|er|ers|ers|ing)?\b|\b(?:hack|cheat|grief|scam|exploit|dup)\w*"
+    return "High" if re.search(pat, blob) else "Normal"
+
+def inactivity_decision(t, now):
+    """Return 'remind_author', 'auto_close' or None.
+    Claimed tickets are never auto-closed. Unclaimed: remind the author after 24 h
+    without their message, close 24 h after the reminder if they still didn't reply."""
+    if t.get("claimed_by"):
+        return None
+    author_last = t.get("last_author_msg") or t["opened_at"]
+    rem = t.get("reminder_sent_at")
+    if rem is not None and author_last > rem:
+        rem = None  # author replied after the reminder
+    if rem is None:
+        return "remind_author" if now - author_last >= AUTHOR_REMIND_AFTER else None
+    return "auto_close" if now - rem >= AUTHOR_CLOSE_AFTER else None
+
+def fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    d, r = divmod(seconds, 86400)
+    h, r = divmod(r, 3600)
+    m, _ = divmod(r, 60)
+    parts = ([f"{d}d"] if d else []) + ([f"{h}h"] if h else []) + [f"{m}m"]
+    return " ".join(parts)
+
+def build_transcript_html(guild_name, channel_name, ticket, messages):
+    """messages: list of dicts {author, avatar, bot, time, content, attachments:[(name,url)], embeds:[str]}"""
+    import html as h
+    e = h.escape
+    cat = TICKET_CATEGORIES.get(ticket.get("category"), ("Unknown", "", "", []))
+    rows = []
+    for m in messages:
+        body = e(m.get("content") or "").replace("\n", "<br>")
+        att = "".join(f'<div class="att">📎 <a href="{e(u)}" target="_blank">{e(n)}</a></div>'
+                      for n, u in m.get("attachments", []))
+        emb = "".join(f'<div class="embed">{e(s).replace(chr(10), "<br>")}</div>' for s in m.get("embeds", []))
+        tag = '<span class="tag">BOT</span>' if m.get("bot") else ""
+        rows.append(
+            f'<div class="msg"><img class="av" src="{e(m.get("avatar") or "")}" alt="">'
+            f'<div class="c"><div class="hd"><span class="name">{e(m.get("author", "?"))}</span>{tag}'
+            f'<span class="time">{e(m.get("time", ""))}</span></div>'
+            f'<div class="body">{body}</div>{att}{emb}</div></div>')
+    info = (f"Ticket #{ticket.get('number')} · {e(cat[1])} {e(cat[0])} · Priority: {e(ticket.get('priority', ''))}"
+            f" · Messages: {len(messages)}")
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Transcript – {e(channel_name)}</title>
+<style>
+body{{background:#313338;color:#dbdee1;font-family:'gg sans','Segoe UI',Helvetica,Arial,sans-serif;margin:0}}
+header{{background:#1e1f22;padding:20px 28px;border-bottom:1px solid #111}}
+header h1{{margin:0;font-size:20px;color:#fff}} header p{{margin:6px 0 0;color:#949ba4;font-size:14px}}
+.wrap{{padding:12px 20px}} .msg{{display:flex;padding:8px;border-radius:6px}} .msg:hover{{background:#2e3035}}
+.av{{width:40px;height:40px;border-radius:50%;margin-right:14px;background:#5865f2;flex-shrink:0}}
+.hd{{display:flex;align-items:center;gap:8px}} .name{{color:#fff;font-weight:600}}
+.tag{{background:#5865f2;color:#fff;font-size:10px;padding:1px 5px;border-radius:3px}}
+.time{{color:#949ba4;font-size:12px}} .body{{margin-top:2px;line-height:1.4;word-wrap:break-word}}
+.att a{{color:#00a8fc}} .embed{{border-left:4px solid #5865f2;background:#2b2d31;padding:8px 12px;margin-top:6px;border-radius:4px;font-size:14px}}
+footer{{color:#949ba4;font-size:12px;padding:16px 28px}}
+</style></head><body>
+<header><h1>#{e(channel_name)} — {e(guild_name)}</h1><p>{info}</p></header>
+<div class="wrap">{''.join(rows) or '<p>No messages.</p>'}</div>
+<footer>Generated by Indiade Bot</footer></body></html>"""
+
+
+# ---------- Discord helpers ----------
+
+def is_staff(member):
+    return isinstance(member, discord.Member) and any(r.id in SUPPORT_ROLE_IDS for r in member.roles)
+
+def support_mentions():
+    return " ".join(f"<@&{r}>" for r in SUPPORT_ROLE_IDS)
+
+def get_ticket(channel_id):
+    return tdata["open"].get(str(channel_id))
+
+def build_ticket_embed(t):
+    label, emoji, _, _ = TICKET_CATEGORIES[t["category"]]
+    em = discord.Embed(title=f"{emoji} {label} — Ticket #{t['number']}",
+                       description="Thanks for opening a ticket! Our staff will be with you shortly.\n"
+                                   "Please add any extra details or screenshots below.",
+                       color=PRIORITY_COLORS.get(t["priority"], 0x3BA7FF),
+                       timestamp=datetime.fromtimestamp(t["opened_at"], timezone.utc))
+    em.add_field(name="👤 Author", value=f"<@{t['author_id']}>", inline=True)
+    em.add_field(name="📂 Category", value=label, inline=True)
+    em.add_field(name="🚦 Priority", value=("🔴 High" if t["priority"] == "High" else "🔵 Normal"), inline=True)
+    em.add_field(name="🙋 Claimed by", value=f"<@{t['claimed_by']}>" if t.get("claimed_by") else "*Unclaimed*", inline=True)
+    for q, a in t.get("answers", []):
+        em.add_field(name=q, value=(a or "-")[:1024], inline=False)
+    em.set_footer(text=f"Ticket #{t['number']} • Opened")
+    return em
+
+async def send_log(embed, file=None):
+    ch = bot.get_channel(TICKET_LOG_CHANNEL_ID)
+    if not ch:
+        print("Ticket log channel not found")
+        return None
+    try:
+        return await ch.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"Ticket log error: {e}")
+        return None
+
+async def safe_reply(interaction, text):
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except Exception:
+        pass
+
+async def get_tickets_category(guild):
+    cat = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+    if cat:
+        return cat
+    return await guild.create_category(TICKET_CATEGORY_NAME, overwrites={
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)})
+
+
+class SafeView(discord.ui.View):
+    async def on_error(self, interaction, error, item):
+        print(f"Ticket view error: {error!r}")
+        msg = "❌ I'm missing permissions to do that." if isinstance(error, discord.Forbidden) \
+            else "❌ Something went wrong. Please try again or contact staff."
+        await safe_reply(interaction, msg)
+
+
+# ---------- Panel / opening ----------
+
+class PanelView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open a ticket", emoji="🎫", style=discord.ButtonStyle.primary, custom_id="ticket:open")
+    async def open_btn(self, interaction, button):
+        await interaction.response.send_message("**Choose a category for your ticket:**",
+                                                view=CategorySelectView(), ephemeral=True)
+
+class CategorySelect(discord.ui.Select):
+    def __init__(self):
+        opts = [discord.SelectOption(label=v[0], emoji=v[1], value=k) for k, v in TICKET_CATEGORIES.items()]
+        super().__init__(placeholder="Select a category…", options=opts, min_values=1, max_values=1)
+
+    async def callback(self, interaction):
+        key = self.values[0]
+        existing = find_open_ticket(interaction.user.id, key)
+        if existing:
+            await interaction.response.send_message(
+                f"You already have an open **{TICKET_CATEGORIES[key][0]}** ticket: <#{existing}>", ephemeral=True)
+            return
+        await interaction.response.send_modal(TicketModal(key))
+
+class CategorySelectView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(CategorySelect())
+
+def find_open_ticket(user_id, category):
+    for cid, t in tdata["open"].items():
+        if t["author_id"] == user_id and t["category"] == category:
+            if bot.get_channel(int(cid)):
+                return int(cid)
+    return None
+
+class TicketModal(discord.ui.Modal):
+    def __init__(self, key):
+        label, emoji, _, qs = TICKET_CATEGORIES[key]
+        super().__init__(title=f"{label} ticket"[:45], timeout=900)
+        self.key = key
+        self.inputs = []
+        for q, ph, mn, para in qs[:5]:
+            ti = discord.ui.TextInput(label=q[:45], placeholder=ph[:100], required=True, min_length=mn,
+                                      max_length=1000 if para else 100,
+                                      style=discord.TextStyle.paragraph if para else discord.TextStyle.short)
+            self.add_item(ti)
+            self.inputs.append((q, ti))
+
+    async def on_error(self, interaction, error):
+        print(f"Ticket modal error: {error!r}")
+        await safe_reply(interaction, "❌ Could not create the ticket (missing permissions?). Please contact staff.")
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        answers = [(q, ti.value.strip()) for q, ti in self.inputs]
+        ch = await create_ticket(interaction, self.key, answers)
+        if ch:
+            await interaction.followup.send(f"✅ Your ticket has been created: {ch.mention}", ephemeral=True)
+
+async def create_ticket(interaction, key, answers):
+    guild, user = interaction.guild, interaction.user
+    if guild is None:
+        await safe_reply(interaction, "Tickets can only be opened in the server.")
+        return None
+    existing = find_open_ticket(user.id, key)
+    if existing:
+        await safe_reply(interaction, f"You already have an open ticket in this category: <#{existing}>")
+        return None
+    label, emoji, slug, _ = TICKET_CATEGORIES[key]
+    try:
+        category = await get_tickets_category(guild)
+        allow = dict(view_channel=True, send_messages=True, attach_files=True, read_message_history=True, embed_links=True)
+        ow = {guild.default_role: discord.PermissionOverwrite(view_channel=False),
+              user: discord.PermissionOverwrite(**allow),
+              guild.me: discord.PermissionOverwrite(manage_channels=True, manage_permissions=True,
+                                                    manage_messages=True, **allow)}
+        for rid in SUPPORT_ROLE_IDS:
+            role = guild.get_role(rid)
+            if role:
+                ow[role] = discord.PermissionOverwrite(**allow)
+        tdata["counter"] += 1
+        number = tdata["counter"]
+        save_tickets()
+        ch = await guild.create_text_channel(ticket_channel_name(slug, user.name), category=category,
+                                             overwrites=ow, topic=f"Ticket #{number} • {label} • {user} ({user.id})")
+    except discord.Forbidden:
+        await safe_reply(interaction, "❌ I don't have permission to create ticket channels. Please contact staff.")
+        return None
+    now = time.time()
+    t = {"number": number, "channel_id": ch.id, "author_id": user.id, "author_name": str(user),
+         "category": key, "priority": detect_priority(*[a for _, a in answers]), "answers": answers,
+         "opened_at": now, "claimed_by": None, "last_author_msg": None, "last_staff_msg": None,
+         "staff_ping_sent": False, "reminder_sent_at": None, "opening_msg_id": None}
+    tdata["open"][str(ch.id)] = t
+    save_tickets()
+    try:
+        msg = await ch.send(content=f"{user.mention} • {support_mentions()}", embed=build_ticket_embed(t),
+                            view=TicketControlView(),
+                            allowed_mentions=discord.AllowedMentions(roles=True, users=True))
+        t["opening_msg_id"] = msg.id
+        save_tickets()
+    except Exception as e:
+        print(f"Ticket opening message error: {e}")
+    em = discord.Embed(title="📬 Ticket opened", color=PRIORITY_COLORS[t["priority"]], timestamp=discord.utils.utcnow())
+    em.add_field(name="Ticket", value=f"#{number} • {ch.mention}", inline=True)
+    em.add_field(name="Author", value=user.mention, inline=True)
+    em.add_field(name="Category", value=f"{emoji} {label}", inline=True)
+    em.add_field(name="Priority", value=t["priority"], inline=True)
+    await send_log(em)
+    return ch
+
+
+# ---------- In-ticket controls ----------
+
+async def claim_ticket(interaction):
+    t = get_ticket(interaction.channel_id)
+    if not t:
+        return await safe_reply(interaction, "This is not an open ticket channel.")
+    if not is_staff(interaction.user):
+        return await safe_reply(interaction, "❌ Only support staff can claim tickets.")
+    if t.get("claimed_by"):
+        return await safe_reply(interaction, f"This ticket is already claimed by <@{t['claimed_by']}>.")
+    t["claimed_by"] = interaction.user.id
+    t["claimed_at"] = time.time()
+    save_tickets()
+    await interaction.response.send_message(f"🙋 {interaction.user.mention} has claimed this ticket and will help you.")
+    try:
+        if t.get("opening_msg_id"):
+            m = await interaction.channel.fetch_message(t["opening_msg_id"])
+            await m.edit(embed=build_ticket_embed(t))
+    except Exception as e:
+        print(f"Ticket embed update error: {e}")
+    em = discord.Embed(title="🙋 Ticket claimed", color=0xFFC83D, timestamp=discord.utils.utcnow(),
+                       description=f"Ticket #{t['number']} ({interaction.channel.mention}) claimed by {interaction.user.mention}")
+    await send_log(em)
+
+class TicketControlView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim", emoji="🙋", style=discord.ButtonStyle.success, custom_id="ticket:claim")
+    async def claim_btn(self, interaction, button):
+        await claim_ticket(interaction)
+
+    @discord.ui.button(label="Close", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket:close")
+    async def close_btn(self, interaction, button):
+        t = get_ticket(interaction.channel_id)
+        if not t:
+            return await safe_reply(interaction, "This ticket is already closed.")
+        if not (is_staff(interaction.user) or interaction.user.id == t["author_id"]):
+            return await safe_reply(interaction, "❌ You can't close this ticket.")
+        await interaction.response.send_message("Are you sure you want to close this ticket?",
+                                                view=CloseConfirmView(), ephemeral=True)
+
+    @discord.ui.button(label="Add user", emoji="➕", style=discord.ButtonStyle.secondary, custom_id="ticket:add")
+    async def add_btn(self, interaction, button):
+        if not get_ticket(interaction.channel_id):
+            return await safe_reply(interaction, "This is not an open ticket channel.")
+        if not is_staff(interaction.user):
+            return await safe_reply(interaction, "❌ Only support staff can add users.")
+        await interaction.response.send_message("Select a user to add:", view=AddUserView(), ephemeral=True)
+
+class CloseConfirmView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Confirm", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        await interaction.response.edit_message(content="🔒 Closing ticket…", view=None)
+        await close_ticket(interaction.channel, interaction.user, "Closed via button")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(content="Close cancelled.", view=None)
+
+class AddUserView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Pick a user…", min_values=1, max_values=1)
+    async def pick(self, interaction, select):
+        await add_user_to_ticket(interaction, select.values[0])
+
+async def add_user_to_ticket(interaction, user):
+    try:
+        await interaction.channel.set_permissions(user, view_channel=True, send_messages=True,
+                                                  attach_files=True, read_message_history=True, embed_links=True)
+    except discord.Forbidden:
+        return await safe_reply(interaction, "❌ I don't have permission to edit this channel.")
+    await safe_reply(interaction, f"✅ Added {user.mention}.")
+    try:
+        await interaction.channel.send(f"➕ {user.mention} was added to the ticket by {interaction.user.mention}.")
+    except Exception:
+        pass
+
+
+# ---------- Closing / rating ----------
+
+def serialize_message(m):
+    embeds = []
+    for e in m.embeds:
+        parts = [e.title or ""] + ([e.description] if e.description else []) + \
+                [f"{f.name}: {f.value}" for f in e.fields]
+        embeds.append("\n".join(p for p in parts if p)[:1500])
+    content = m.content or ""
+    if m.type != discord.MessageType.default and not content and not embeds and not m.attachments:
+        content = f"[{m.type.name}]"
+    return {"author": m.author.display_name + f" ({m.author.name})", "avatar": m.author.display_avatar.url,
+            "bot": m.author.bot, "time": m.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "content": content, "attachments": [(a.filename, a.url) for a in m.attachments], "embeds": embeds}
+
+async def close_ticket(channel, closed_by, reason):
+    t = get_ticket(channel.id)
+    if not t or channel.id in closing_channels:
+        return
+    closing_channels.add(channel.id)
+    try:
+        msgs = []
+        try:
+            async for m in channel.history(limit=None, oldest_first=True):
+                msgs.append(serialize_message(m))
+        except Exception as e:
+            print(f"Transcript history error: {e}")
+        html_doc = build_transcript_html(channel.guild.name, channel.name, t, msgs)
+        now = time.time()
+        rec = dict(t, closed_at=now, closed_by=getattr(closed_by, "id", None), reason=reason,
+                   rating=None, log_msg_id=None, channel_name=channel.name)
+        tdata["open"].pop(str(channel.id), None)
+        tdata["closed"].append(rec)
+        save_tickets()
+
+        label, emoji, _, _ = TICKET_CATEGORIES[t["category"]]
+        em = discord.Embed(title="🔒 Ticket closed", color=0x99AAB5, timestamp=discord.utils.utcnow())
+        em.add_field(name="Ticket", value=f"#{t['number']} • `{channel.name}`", inline=True)
+        em.add_field(name="Author", value=f"<@{t['author_id']}>", inline=True)
+        em.add_field(name="Category", value=f"{emoji} {label}", inline=True)
+        em.add_field(name="Closed by", value=closed_by.mention if closed_by else "🤖 System", inline=True)
+        em.add_field(name="Claimed by", value=f"<@{t['claimed_by']}>" if t.get("claimed_by") else "—", inline=True)
+        em.add_field(name="Duration", value=fmt_duration(now - t["opened_at"]), inline=True)
+        em.add_field(name="Reason", value=reason[:1024], inline=False)
+        em.add_field(name="Rating", value="*Waiting for the author…*", inline=False)
+        f = discord.File(io.BytesIO(html_doc.encode("utf-8")), filename=f"transcript-{t['number']}-{channel.name}.html")
+        lm = await send_log(em, file=f)
+        if lm:
+            rec["log_msg_id"] = lm.id
+            save_tickets()
+
+        # Rating prompt for the author
+        rate_em = discord.Embed(title="⭐ How did we do?",
+                                description=f"Your ticket **#{t['number']}** ({label}) on **{channel.guild.name}** was closed.\n"
+                                            "Please rate the support you received (1–5 stars).",
+                                color=0xFFC83D)
+        wait = 5
+        sent = None
+        try:
+            author = channel.guild.get_member(t["author_id"]) or await bot.fetch_user(t["author_id"])
+            sent = await author.send(embed=rate_em, view=RatingView())
+        except Exception:
+            try:
+                sent = await channel.send(content=f"<@{t['author_id']}>", embed=rate_em, view=RatingView())
+                wait = 30
+            except Exception:
+                sent = None
+        if sent:
+            tdata["rating_msgs"][str(sent.id)] = t["number"]
+            save_tickets()
+        try:
+            await channel.send(f"🔒 This ticket will be deleted in {wait} seconds.")
+        except Exception:
+            pass
+        await asyncio.sleep(wait)
+        try:
+            await channel.delete(reason=f"Ticket #{t['number']} closed: {reason}")
+        except Exception as e:
+            print(f"Ticket channel delete error: {e}")
+    finally:
+        closing_channels.discard(channel.id)
+
+class RatingView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for i in range(1, 6):
+            b = discord.ui.Button(label=str(i), emoji="⭐", style=discord.ButtonStyle.secondary,
+                                  custom_id=f"ticket:rate:{i}")
+            b.callback = self.make_cb(i)
+            self.add_item(b)
+
+    def make_cb(self, stars):
+        async def cb(interaction):
+            num = tdata["rating_msgs"].get(str(interaction.message.id))
+            rec = next((r for r in tdata["closed"] if r["number"] == num), None)
+            if rec is None:
+                return await safe_reply(interaction, "This rating is no longer available.")
+            if interaction.user.id != rec["author_id"]:
+                return await safe_reply(interaction, "Only the ticket author can rate it.")
+            if rec.get("rating"):
+                return await safe_reply(interaction, "You've already rated this ticket. Thanks!")
+            rec["rating"] = stars
+            tdata["rating_msgs"].pop(str(interaction.message.id), None)
+            save_tickets()
+            try:
+                await interaction.response.edit_message(
+                    content=f"Thanks for your feedback! You rated us {'⭐' * stars}", embed=None, view=None)
+            except Exception:
+                pass
+            await update_close_log_rating(rec)
+        return cb
+
+async def update_close_log_rating(rec):
+    ch = bot.get_channel(TICKET_LOG_CHANNEL_ID)
+    if not ch or not rec.get("log_msg_id"):
+        return
+    try:
+        m = await ch.fetch_message(rec["log_msg_id"])
+        em = m.embeds[0]
+        for i, f in enumerate(em.fields):
+            if f.name == "Rating":
+                em.set_field_at(i, name="Rating", value=f"{'⭐' * rec['rating']} ({rec['rating']}/5)", inline=False)
+        await m.edit(embed=em)
+    except Exception as e:
+        print(f"Rating log update error: {e}")
+
+
+# ---------- Activity tracking & inactivity loop ----------
+
+async def ticket_on_message(message):
+    if message.author.bot or message.guild is None:
+        return
+    t = get_ticket(message.channel.id)
+    if not t:
+        return
+    now = time.time()
+    if message.author.id == t["author_id"]:
+        t["last_author_msg"] = now
+        t["reminder_sent_at"] = None
+    elif is_staff(message.author):
+        t["last_staff_msg"] = now
+        t["staff_ping_sent"] = False
+    else:
+        return
+    save_tickets()
+
+async def ticket_inactivity_loop():
+    while True:
+        await asyncio.sleep(INACTIVITY_CHECK_EVERY)
+        try:
+            now = time.time()
+            for cid, t in list(tdata["open"].items()):
+                ch = bot.get_channel(int(cid))
+                if ch is None:
+                    continue
+                action = inactivity_decision(t, now)
+                if action == "ping_staff":
+                    t["staff_ping_sent"] = True
+                    save_tickets()
+                    await ch.send(f"⏰ {support_mentions()} This ticket is still waiting for staff.",
+                                  allowed_mentions=discord.AllowedMentions(roles=True))
+                    await send_log(discord.Embed(title="⏰ Unclaimed ticket reminder", color=0xFF9F1C,
+                                                 description=f"Ticket #{t['number']} ({ch.mention}) has had no staff reply for 4+ hours."))
+                elif action == "remind_author":
+                    t["reminder_sent_at"] = now
+                    save_tickets()
+                    await ch.send(f"👋 <@{t['author_id']}> Do you still need help? Please reply, otherwise this "
+                                  f"ticket will be closed automatically in 24 hours.")
+                elif action == "auto_close":
+                    bot.loop.create_task(close_ticket(ch, None, "Inactive author (unclaimed)"))
+        except Exception as e:
+            print(f"Ticket inactivity loop error: {e}")
+
+
+# ---------- Panel ----------
+
+def build_panel_embed():
+    em = discord.Embed(title=PANEL_TITLE, color=0x5865F2,
+                       description="Need help? Open a private ticket and our staff team will assist you.\n\n"
+                                   + "\n".join(f"{v[1]} **{v[0]}**" for v in TICKET_CATEGORIES.values())
+                                   + "\n\nClick the button below, pick a category and fill in the short form.")
+    em.set_author(name="Indiade Support", icon_url=LOGO_URL)
+    em.set_thumbnail(url=LOGO_URL)
+    em.set_footer(text="Please don't open tickets without a reason • One ticket per category")
+    return em
+
+async def setup_ticket_panel():
+    ch = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
+    if not ch:
+        print("Ticket panel channel not found")
+        return
+    em, view = build_panel_embed(), PanelView()
+    msg = None
+    if tdata.get("panel_message_id"):
+        try:
+            msg = await ch.fetch_message(tdata["panel_message_id"])
+        except Exception:
+            msg = None
+    if msg is None:
+        try:
+            async for m in ch.history(limit=50):
+                if m.author == bot.user and m.embeds and m.embeds[0].title == PANEL_TITLE:
+                    msg = m
+                    break
+        except Exception:
+            pass
+    try:
+        if msg:
+            await msg.edit(embed=em, view=view)
+        else:
+            msg = await ch.send(embed=em, view=view)
+        tdata["panel_message_id"] = msg.id
+        save_tickets()
+    except Exception as e:
+        print(f"Ticket panel error: {e}")
+
+def register_ticket_views():
+    bot.add_view(PanelView())
+    bot.add_view(TicketControlView())
+    bot.add_view(RatingView())
+
+
+# ---------- /ticket commands ----------
+
+ticket_group = app_commands.Group(name="ticket", description="Ticket staff commands", guild_only=True)
+
+async def staff_in_ticket(interaction, need_ticket=True):
+    if not is_staff(interaction.user):
+        await safe_reply(interaction, "❌ Only support staff can use this command.")
+        return None
+    t = get_ticket(interaction.channel_id)
+    if need_ticket and not t:
+        await safe_reply(interaction, "❌ This command only works inside an open ticket channel.")
+        return None
+    return t or {}
+
+@ticket_group.command(name="add", description="Add a user to this ticket")
+async def ticket_add(interaction: discord.Interaction, user: discord.Member):
+    if await staff_in_ticket(interaction) is not None:
+        await add_user_to_ticket(interaction, user)
+
+@ticket_group.command(name="remove", description="Remove a user from this ticket")
+async def ticket_remove(interaction: discord.Interaction, user: discord.Member):
+    t = await staff_in_ticket(interaction)
+    if t is None:
+        return
+    if user.id == t["author_id"]:
+        return await safe_reply(interaction, "❌ You can't remove the ticket author.")
+    try:
+        await interaction.channel.set_permissions(user, overwrite=None)
+    except discord.Forbidden:
+        return await safe_reply(interaction, "❌ I don't have permission to edit this channel.")
+    await interaction.response.send_message(f"➖ {user.mention} was removed from the ticket.")
+
+@ticket_group.command(name="rename", description="Rename this ticket channel")
+async def ticket_rename(interaction: discord.Interaction, name: str):
+    if await staff_in_ticket(interaction) is None:
+        return
+    new = slugify(name) or "ticket"
+    try:
+        await interaction.channel.edit(name=new)
+    except discord.Forbidden:
+        return await safe_reply(interaction, "❌ I don't have permission to rename this channel.")
+    except discord.HTTPException:
+        return await safe_reply(interaction, "❌ Rename failed (Discord limits renames to 2 per 10 minutes).")
+    await interaction.response.send_message(f"✏️ Channel renamed to `{new}`.")
+
+@ticket_group.command(name="close", description="Close this ticket")
+async def ticket_close(interaction: discord.Interaction, reason: str | None = None):
+    if await staff_in_ticket(interaction) is None:
+        return
+    await interaction.response.send_message("🔒 Closing ticket…")
+    await close_ticket(interaction.channel, interaction.user, reason or "No reason given")
+
+@ticket_group.command(name="claim", description="Claim this ticket")
+async def ticket_claim(interaction: discord.Interaction):
+    await claim_ticket(interaction)
+
+def compute_ticket_stats(d):
+    closed = d["closed"]
+    durations = [r["closed_at"] - r["opened_at"] for r in closed if r.get("closed_at")]
+    ratings = [r["rating"] for r in closed if r.get("rating")]
+    per_cat, claimers = {}, {}
+    for r in closed + list(d["open"].values()):
+        per_cat[r["category"]] = per_cat.get(r["category"], 0) + 1
+        if r.get("claimed_by"):
+            claimers[r["claimed_by"]] = claimers.get(r["claimed_by"], 0) + 1
+    return {"open": len(d["open"]), "closed": len(closed),
+            "avg_resolution": sum(durations) / len(durations) if durations else None,
+            "avg_rating": sum(ratings) / len(ratings) if ratings else None, "ratings": len(ratings),
+            "per_category": per_cat,
+            "top_claimers": sorted(claimers.items(), key=lambda kv: kv[1], reverse=True)[:5]}
+
+@ticket_group.command(name="stats", description="Ticket statistics")
+async def ticket_stats(interaction: discord.Interaction):
+    if await staff_in_ticket(interaction, need_ticket=False) is None:
+        return
+    s = compute_ticket_stats(tdata)
+    em = discord.Embed(title="📊 Ticket statistics", color=0x5865F2, timestamp=discord.utils.utcnow())
+    em.add_field(name="📂 Open", value=str(s["open"]), inline=True)
+    em.add_field(name="🔒 Closed", value=str(s["closed"]), inline=True)
+    em.add_field(name="⏱️ Avg resolution", value=fmt_duration(s["avg_resolution"]) if s["avg_resolution"] is not None else "—", inline=True)
+    em.add_field(name="⭐ Avg rating", value=f"{s['avg_rating']:.2f}/5 ({s['ratings']} ratings)" if s["avg_rating"] else "—", inline=True)
+    em.add_field(name="🗂️ Per category", inline=False, value="\n".join(
+        f"{TICKET_CATEGORIES[k][1]} {TICKET_CATEGORIES[k][0]}: **{v}**" for k, v in s["per_category"].items()
+        if k in TICKET_CATEGORIES) or "—")
+    em.add_field(name="🙋 Top claimers", inline=False, value="\n".join(
+        f"**{i+1}.** <@{uid}> – {n}" for i, (uid, n) in enumerate(s["top_claimers"])) or "—")
+    await interaction.response.send_message(embed=em, ephemeral=True)
+
+tree.add_command(ticket_group)
+
+@tree.error
+async def on_app_command_error(interaction, error):
+    print(f"Slash command error: {error!r}")
+    orig = getattr(error, "original", error)
+    await safe_reply(interaction, "❌ I'm missing permissions to do that." if isinstance(orig, discord.Forbidden)
+                     else "❌ Something went wrong while running this command.")
+
+@bot.event
+async def on_message(message):
+    try:
+        await ticket_on_message(message)
+    except Exception as e:
+        print(f"on_message error: {e}")
+
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
