@@ -21,7 +21,7 @@ INVITE_LOG_CHANNEL_ID = 1562867004707176448
 # Minecraft server
 MC_SERVER = "play.indiade.net"
 
-# Soubor s počty pozvánek (vytvoří se sám vedle bot.py)
+# Invite counts file (created next to bot.py)
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invites.json")
 
 intents = discord.Intents.default()
@@ -36,7 +36,7 @@ invite_cache = {}   # guild_id -> {code: uses}
 vanity_cache = {}   # guild_id -> uses
 
 
-# ---------- Ukládání dat o pozvánkách ----------
+# ---------- Invite data storage ----------
 
 def load_data():
     try:
@@ -61,14 +61,14 @@ def total(s):
     return s["joins"] - s["left"] - s["fake"]
 
 
-# ---------- Cache pozvánek ----------
+# ---------- Invite cache ----------
 
 async def cache_guild_invites(guild):
     try:
         invites = await guild.invites()
         invite_cache[guild.id] = {i.code: i.uses for i in invites}
     except discord.Forbidden:
-        print(f"Chybí oprávnění 'Spravovat server' na {guild.name} – invite logger nepojede.")
+        print(f"Missing 'Manage Server' permission on {guild.name} - invite logger disabled.")
         invite_cache[guild.id] = {}
     try:
         vanity = await guild.vanity_invite()
@@ -77,7 +77,7 @@ async def cache_guild_invites(guild):
         vanity_cache[guild.id] = None
 
 async def find_used_invite(guild):
-    """Porovná počty použití pozvánek před a po připojení."""
+    """Compare invite use counts before and after a join."""
     old = invite_cache.get(guild.id, {})
     try:
         new_invites = await guild.invites()
@@ -89,7 +89,7 @@ async def find_used_invite(guild):
             used = inv
             break
     if used is None:
-        # Pozvánka s omezeným počtem použití po použití zmizí
+        # Limited-use invites disappear after being used
         new_codes = {i.code for i in new_invites}
         gone = [c for c in old if c not in new_codes]
         invite_cache[guild.id] = {i.code: i.uses for i in new_invites}
@@ -98,7 +98,7 @@ async def find_used_invite(guild):
     invite_cache[guild.id] = {i.code: i.uses for i in new_invites}
     if used:
         return used, "invite"
-    # Vlastní URL serveru (vanity)
+    # Server vanity URL
     try:
         vanity = await guild.vanity_invite()
         if vanity and vanity_cache.get(guild.id) is not None and vanity.uses > vanity_cache[guild.id]:
@@ -109,7 +109,7 @@ async def find_used_invite(guild):
     return None, "unknown"
 
 
-# ---------- MC status (původní) ----------
+# ---------- MC status ----------
 
 async def get_server_status():
     try:
@@ -137,21 +137,21 @@ async def update_status_embed():
 
     if data_["online"]:
         embed = discord.Embed(title="Indiade MC Server Status", color=discord.Color.green(), description="**ONLINE**")
-        embed.add_field(name="Název", value="Indiade", inline=True)
-        embed.add_field(name="MC Verze", value="1.21", inline=True)
-        embed.add_field(name="Vývojová verze", value="1.0 BETA", inline=True)
-        embed.add_field(name="Hráči", value=data_["players"], inline=True)
-        embed.add_field(name="Latence", value=f"{data_['latency']} ms", inline=True)
-        embed.add_field(name="Verze serveru", value=data_["version"], inline=True)
+        embed.add_field(name="Name", value="Indiade", inline=True)
+        embed.add_field(name="MC Version", value="1.21", inline=True)
+        embed.add_field(name="Dev Version", value="1.0 BETA", inline=True)
+        embed.add_field(name="Players", value=data_["players"], inline=True)
+        embed.add_field(name="Latency", value=f"{data_['latency']} ms", inline=True)
+        embed.add_field(name="Server Version", value=data_["version"], inline=True)
         embed.add_field(name="MOTD", value=data_["motd"][:100] or "-", inline=False)
-        embed.add_field(name="Uptime / Další restart", value="N/A (není dostupné přes query)", inline=False)
+        embed.add_field(name="Uptime / Next restart", value="N/A (not available via query)", inline=False)
     else:
         embed = discord.Embed(title="Indiade MC Server Status", color=discord.Color.red(), description="**OFFLINE**")
-        embed.add_field(name="Název", value="Indiade", inline=True)
-        embed.add_field(name="MC Verze", value="1.21", inline=True)
-        embed.add_field(name="Vývojová verze", value="1.0 BETA", inline=True)
+        embed.add_field(name="Name", value="Indiade", inline=True)
+        embed.add_field(name="MC Version", value="1.21", inline=True)
+        embed.add_field(name="Dev Version", value="1.0 BETA", inline=True)
 
-    embed.set_footer(text="Aktualizováno automaticky")
+    embed.set_footer(text="Updated automatically")
 
     if status_message:
         try:
@@ -184,21 +184,21 @@ started = False
 @bot.event
 async def on_ready():
     global started
-    print(f"Logged in as {bot.user}, serverů: {len(bot.guilds)}")
+    print(f"Logged in as {bot.user}, guilds: {len(bot.guilds)}")
     if not started:
         started = True
-        # Synchronizace příkazů přímo na servery = okamžitě viditelné
+        # Sync commands per guild so they appear instantly
         for guild in bot.guilds:
             try:
                 tree.copy_global_to(guild=guild)
                 cmds = await tree.sync(guild=guild)
-                print(f"Slash příkazy na {guild.name}: {[c.name for c in cmds]}")
+                print(f"Slash commands on {guild.name}: {[c.name for c in cmds]}")
             except Exception as e:
-                print(f"Slash command sync error na {guild.name}: {e}")
+                print(f"Slash command sync error on {guild.name}: {e}")
         bot.loop.create_task(status_loop())
     for guild in bot.guilds:
         await cache_guild_invites(guild)
-    print("Invite cache připravena")
+    print("Invite cache ready")
     await update_status_embed()
 
 @bot.event
@@ -217,7 +217,7 @@ async def on_guild_join(guild):
 
 @bot.event
 async def on_member_join(member):
-    # Uvítání (původní)
+    # Welcome message
     channel = bot.get_channel(WELCOME_CHANNEL_ID)
     if channel:
         embed = discord.Embed(
@@ -245,7 +245,7 @@ async def on_member_join(member):
     elif kind == "vanity":
         code = invite.code
 
-    # Účet mladší než 7 dní počítáme jako podezřelý (fake)
+    # Accounts younger than 7 days count as suspicious (fake)
     account_age = (discord.utils.utcnow() - member.created_at).days
     fake = account_age < 7
 
@@ -263,26 +263,26 @@ async def on_member_join(member):
 
     if inviter:
         s = stats_for(inviter.id)
-        desc = (f"{member.mention} se připojil/a na pozvánku od {inviter.mention} (`{code}`).\n"
-                f"{inviter.mention} má teď **{total(s)}** pozvánek "
-                f"({s['joins']} celkem, {s['left']} odešlo, {s['fake']} podezřelých).")
+        desc = (f"{member.mention} joined using {inviter.mention}'s invite (`{code}`).\n"
+                f"{inviter.mention} now has **{total(s)}** invites "
+                f"({s['joins']} total, {s['left']} left, {s['fake']} fake).")
     elif kind == "vanity":
-        desc = f"{member.mention} se připojil/a přes vlastní odkaz serveru (`{code}`)."
+        desc = f"{member.mention} joined using the server's vanity URL (`{code}`)."
     elif kind == "gone":
-        desc = f"{member.mention} se připojil/a přes jednorázovou pozvánku `{code}` (autora se nepodařilo zjistit)."
+        desc = f"{member.mention} joined using a single-use invite `{code}` (inviter unknown)."
     else:
-        desc = f"{member.mention} se připojil/a, ale nepodařilo se zjistit, přes jakou pozvánku."
+        desc = f"{member.mention} joined, but the invite used couldn't be determined."
 
-    embed = discord.Embed(title="📥 Nový člen", description=desc, color=discord.Color.blurple())
+    embed = discord.Embed(title="📥 Member joined", description=desc, color=discord.Color.blurple())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Stáří účtu", value=f"{account_age} dní" + (" ⚠️" if fake else ""), inline=True)
-    embed.add_field(name="Členů", value=str(member.guild.member_count), inline=True)
+    embed.add_field(name="Account age", value=f"{account_age} days" + (" ⚠️" if fake else ""), inline=True)
+    embed.add_field(name="Members", value=str(member.guild.member_count), inline=True)
     await log.send(embed=embed)
 
 @bot.event
 async def on_member_remove(member):
     info = data["joined_by"].pop(str(member.id), None)
-    inviter_text = "neznámý"
+    inviter_text = "unknown"
     if info:
         s = stats_for(info["inviter"])
         if info.get("fake"):
@@ -291,35 +291,35 @@ async def on_member_remove(member):
         else:
             s["left"] += 1
         save_data()
-        inviter_text = f"<@{info['inviter']}> (teď má **{total(s)}** pozvánek)"
+        inviter_text = f"<@{info['inviter']}> (now has **{total(s)}** invites)"
     log = bot.get_channel(INVITE_LOG_CHANNEL_ID)
     if log:
         embed = discord.Embed(
-            title="📤 Člen odešel",
-            description=f"**{member}** opustil/a server. Pozval/a ho/ji: {inviter_text}.",
+            title="📤 Member left",
+            description=f"**{member}** left the server. Invited by: {inviter_text}.",
             color=discord.Color.red(),
         )
         await log.send(embed=embed)
 
 
-# ---------- Slash příkazy ----------
+# ---------- Slash commands ----------
 
-@tree.command(name="invites", description="Kolik lidí někdo pozval")
-@app_commands.describe(member="Člen (prázdné = ty)")
+@tree.command(name="invites", description="Show how many people a member invited")
+@app_commands.describe(member="Member (empty = you)")
 async def invites_cmd(interaction: discord.Interaction, member: discord.Member | None = None):
     member = member or interaction.user
     s = stats_for(member.id)
     await interaction.response.send_message(
-        f"{member.mention} má **{total(s)}** pozvánek ({s['joins']} celkem, {s['left']} odešlo, {s['fake']} podezřelých).")
+        f"{member.mention} has **{total(s)}** invites ({s['joins']} total, {s['left']} left, {s['fake']} fake).")
 
-@tree.command(name="invites-top", description="Žebříček pozvánek")
+@tree.command(name="invites-top", description="Invite leaderboard")
 async def invites_top(interaction: discord.Interaction):
     rows = sorted(data["inviters"].items(), key=lambda kv: total(kv[1]), reverse=True)[:10]
     if not rows:
-        await interaction.response.send_message("Zatím nikdo nikoho nepozval.")
+        await interaction.response.send_message("Nobody has invited anyone yet.")
         return
     lines = [f"**{i+1}.** <@{uid}> – {total(s)}" for i, (uid, s) in enumerate(rows)]
-    embed = discord.Embed(title="🏆 Žebříček pozvánek", description="\n".join(lines), color=discord.Color.gold())
+    embed = discord.Embed(title="🏆 Invite Leaderboard", description="\n".join(lines), color=discord.Color.gold())
     await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
