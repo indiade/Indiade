@@ -1,4 +1,8 @@
 import os
+import sys
+import functools
+import builtins
+print = functools.partial(builtins.print, flush=True)
 import json
 import asyncio
 import discord
@@ -180,9 +184,7 @@ started = False
 @bot.event
 async def on_ready():
     global started
-    print(f"Logged in as {bot.user}")
-    for guild in bot.guilds:
-        await cache_guild_invites(guild)
+    print(f"Logged in as {bot.user}, serverů: {len(bot.guilds)}")
     if not started:
         started = True
         # Synchronizace příkazů přímo na servery = okamžitě viditelné
@@ -194,6 +196,9 @@ async def on_ready():
             except Exception as e:
                 print(f"Slash command sync error na {guild.name}: {e}")
         bot.loop.create_task(status_loop())
+    for guild in bot.guilds:
+        await cache_guild_invites(guild)
+    print("Invite cache připravena")
     await update_status_embed()
 
 @bot.event
