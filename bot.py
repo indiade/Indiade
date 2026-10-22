@@ -117,14 +117,62 @@ async def get_server_status():
         status = await server.async_status()
         return {
             "online": True,
-            "players": f"{status.players.online}/{status.players.max}",
+            "players_online": status.players.online,
+            "players_max": status.players.max,
+            "names": [p.name for p in (status.players.sample or []) if p.name and "§" not in p.name],
             "latency": round(status.latency),
             "version": status.version.name,
-            "motd": str(status.description),
+            "motd": status.motd.to_plain() if hasattr(status, "motd") else str(status.description),
         }
     except Exception as e:
         print(f"MC status error: {e}")
         return {"online": False}
+
+LOGO_URL = "https://cdn.indiade.com/brand/discord/servers.png"
+SERVER_PAGE = "https://indiade.com/servers"
+STATUS_TITLE = "Indiade MC Server Status"
+
+def player_bar(online, maximum, size=12):
+    if maximum <= 0:
+        return "`" + "░" * size + "`"
+    filled = round(size * min(online, maximum) / maximum)
+    return "`" + "█" * filled + "░" * (size - filled) + "`"
+
+def build_status_embed(d):
+    now = discord.utils.utcnow()
+    if d["online"]:
+        on, mx = d["players_online"], d["players_max"]
+        embed = discord.Embed(
+            title=STATUS_TITLE,
+            url=SERVER_PAGE,
+            description="🟢 **Server is ONLINE**\nJump in and play with us!",
+            color=0x2BFF88,
+            timestamp=now,
+        )
+        embed.add_field(name="🌐 Server IP", value=f"```{MC_SERVER}```", inline=False)
+        embed.add_field(name="👥 Players", value=f"**{on} / {mx}**\n{player_bar(on, mx)}", inline=True)
+        embed.add_field(name="📶 Ping", value=f"**{d['latency']} ms**", inline=True)
+        embed.add_field(name="🧩 Version", value=f"**{d['version']}**", inline=True)
+        if d.get("names"):
+            embed.add_field(name="🎮 Online now", value=", ".join(d["names"][:15])[:1000], inline=False)
+        if d["motd"].strip():
+            embed.add_field(name="💬 MOTD", value=f"*{d['motd'].strip()[:200]}*", inline=False)
+    else:
+        embed = discord.Embed(
+            title=STATUS_TITLE,
+            url=SERVER_PAGE,
+            description="🔴 **Server is OFFLINE**\nWe'll be back soon. Stay tuned in this channel!",
+            color=0xFF2E4D,
+            timestamp=now,
+        )
+        embed.add_field(name="🌐 Server IP", value=f"```{MC_SERVER}```", inline=False)
+    embed.add_field(name="🏷️ Minecraft", value="Java 1.21+", inline=True)
+    embed.add_field(name="🛠️ Build", value="1.0 BETA", inline=True)
+    embed.add_field(name="🔗 Website", value=f"[indiade.com/servers]({SERVER_PAGE})", inline=True)
+    embed.set_author(name="Indiade Servers", url=SERVER_PAGE, icon_url=LOGO_URL)
+    embed.set_thumbnail(url=LOGO_URL)
+    embed.set_footer(text="Auto-updates every 2 minutes • Last update", icon_url=LOGO_URL)
+    return embed
 
 async def update_status_embed():
     global status_message
@@ -133,37 +181,19 @@ async def update_status_embed():
         print("Status channel not found")
         return
 
-    data_ = await get_server_status()
-
-    if data_["online"]:
-        embed = discord.Embed(title="Indiade MC Server Status", color=discord.Color.green(), description="**ONLINE**")
-        embed.add_field(name="Name", value="Indiade", inline=True)
-        embed.add_field(name="MC Version", value="1.21", inline=True)
-        embed.add_field(name="Dev Version", value="1.0 BETA", inline=True)
-        embed.add_field(name="Players", value=data_["players"], inline=True)
-        embed.add_field(name="Latency", value=f"{data_['latency']} ms", inline=True)
-        embed.add_field(name="Server Version", value=data_["version"], inline=True)
-        embed.add_field(name="MOTD", value=data_["motd"][:100] or "-", inline=False)
-        embed.add_field(name="Uptime / Next restart", value="N/A (not available via query)", inline=False)
-    else:
-        embed = discord.Embed(title="Indiade MC Server Status", color=discord.Color.red(), description="**OFFLINE**")
-        embed.add_field(name="Name", value="Indiade", inline=True)
-        embed.add_field(name="MC Version", value="1.21", inline=True)
-        embed.add_field(name="Dev Version", value="1.0 BETA", inline=True)
-
-    embed.set_footer(text="Updated automatically")
+    embed = build_status_embed(await get_server_status())
 
     if status_message:
         try:
-            await status_message.edit(embed=embed)
+            await status_message.edit(content=None, embed=embed)
             return
         except Exception:
             pass
 
     async for msg in channel.history(limit=20):
-        if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "Indiade MC Server Status":
+        if msg.author == bot.user and msg.embeds and msg.embeds[0].title == STATUS_TITLE:
             status_message = msg
-            await status_message.edit(embed=embed)
+            await status_message.edit(content=None, embed=embed)
             return
 
     status_message = await channel.send(embed=embed)
@@ -177,7 +207,54 @@ async def status_loop():
             print(f"Status update error: {e}")
 
 
-# ---------- Eventy ----------
+
+LEADERBOARD_TITLE = "🏆 Invite Leaderboard"
+
+def build_leaderboard_embed():
+    rows = sorted(data["inviters"].items(), key=lambda kv: total(kv[1]), reverse=True)
+    rows = [r for r in rows if r[1]["joins"] > 0][:15]
+    medals = ["🥇", "🥈", "🥉"]
+    if rows:
+        lines = []
+        for i, (uid, st) in enumerate(rows):
+            pos = medals[i] if i < 3 else f"**{i+1}.**"
+            lines.append(f"{pos} <@{uid}> **{total(st)}** invites  ·  {st['joins']} joined, {st['left']} left, {st['fake']} fake")
+        desc = "\n".join(lines)
+    else:
+        desc = "Nobody has invited anyone yet. Be the first!"
+    all_total = sum(max(0, total(st)) for st in data["inviters"].values())
+    embed = discord.Embed(title=LEADERBOARD_TITLE, description=desc, color=0xFFC83D, timestamp=discord.utils.utcnow())
+    embed.add_field(name="📊 Total invites", value=f"**{all_total}**", inline=True)
+    embed.add_field(name="👥 Inviters", value=f"**{len(rows)}**", inline=True)
+    embed.set_footer(text="Updates automatically on every join/leave • Use /invites")
+    return embed
+
+leaderboard_message = None
+
+async def update_leaderboard():
+    global leaderboard_message
+    channel = bot.get_channel(INVITE_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    embed = build_leaderboard_embed()
+    if leaderboard_message is None:
+        mid = data.get("leaderboard_message_id")
+        if mid:
+            try:
+                leaderboard_message = await channel.fetch_message(mid)
+            except Exception:
+                leaderboard_message = None
+    # Keep it as the latest message: delete the old one and repost below the new log entry
+    if leaderboard_message:
+        try:
+            await leaderboard_message.delete()
+        except Exception:
+            pass
+    leaderboard_message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    data["leaderboard_message_id"] = leaderboard_message.id
+    save_data()
+
+# ---------- Events ----------
 
 started = False
 
@@ -199,6 +276,10 @@ async def on_ready():
     for guild in bot.guilds:
         await cache_guild_invites(guild)
     print("Invite cache ready")
+    try:
+        await update_leaderboard()
+    except Exception as e:
+        print(f"Leaderboard error: {e}")
     await update_status_embed()
 
 @bot.event
@@ -278,6 +359,7 @@ async def on_member_join(member):
     embed.add_field(name="Account age", value=f"{account_age} days" + (" ⚠️" if fake else ""), inline=True)
     embed.add_field(name="Members", value=str(member.guild.member_count), inline=True)
     await log.send(embed=embed)
+    await update_leaderboard()
 
 @bot.event
 async def on_member_remove(member):
@@ -300,6 +382,7 @@ async def on_member_remove(member):
             color=discord.Color.red(),
         )
         await log.send(embed=embed)
+        await update_leaderboard()
 
 
 # ---------- Slash commands ----------
